@@ -39,13 +39,19 @@ class ExpTracker:
 
     def _capture_and_preprocess(self) -> np.ndarray:
         raw = np.array(self.sct.grab(self.region))
-        gray = cv2.cvtColor(raw, cv2.COLOR_BGRA2GRAY)
+        bgr = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
+        green_mask = cv2.inRange(hsv, (30, 80, 100), (90, 255, 255))
+        green_cols = np.where(green_mask.sum(axis=0) > 0)[0]
+
+        if len(green_cols) > 0 and green_cols[0] > 10:
+            bgr = bgr[:, : green_cols[0]]
+
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         scaled = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_LANCZOS4)
-
         inverted = cv2.bitwise_not(scaled)
         _, clean = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
         padded = cv2.copyMakeBorder(clean, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
         return padded
 
@@ -56,8 +62,7 @@ class ExpTracker:
             return None, ""
 
         combined_text = " ".join(line[1] for line in result)
-        match = EXP_PATTERN.search(combined_text)
-        prefix = match.group(1) if match else combined_text.split("[")[0]
+        prefix = combined_text.split("[")[0]
         digits_only = re.sub(r"[^\d]", "", prefix)
         return (int(digits_only) if digits_only else None), combined_text
 
