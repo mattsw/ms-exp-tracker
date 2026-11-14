@@ -1,5 +1,9 @@
+import threading
+import time
 import tkinter as tk
 from collections.abc import Callable
+
+import mss
 
 from region_selector import enable_dpi_awareness
 from tracker import ExpMetrics, ExpTracker
@@ -10,8 +14,11 @@ class DraggableOverlay:
         enable_dpi_awareness()
         self.tracker = tracker
         self.on_reselect = on_reselect
+        self._latest_metrics = ExpMetrics()
+        self._running = True
 
         self.root = tk.Tk()
+        self.root.title("MS EXP TRACKER")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.88)
@@ -31,7 +38,7 @@ class DraggableOverlay:
         title.pack(side=tk.LEFT, padx=4, pady=2)
 
         close_btn = tk.Button(
-            self.header, text="×", command=self.root.destroy,
+            self.header, text="×", command=self._close,
             fg="#E8EAED", bg="#1F2429", bd=0, font=("Consolas", 10, "bold"),
             activebackground="#D93025", activeforeground="white"
         )
@@ -62,6 +69,10 @@ class DraggableOverlay:
             fg="#E8EAED", bg="#2B3036", bd=0, padx=6, font=("Consolas", 8)
         ).pack(side=tk.LEFT)
 
+    def _close(self) -> None:
+        self._running = False
+        self.root.destroy()
+
     def _start_drag(self, event: tk.Event) -> None:
         self._drag_x = event.x
         self._drag_y = event.y
@@ -72,6 +83,7 @@ class DraggableOverlay:
         self.root.geometry(f"+{x}+{y}")
 
     def _trigger_reselect(self) -> None:
+        self._running = False
         self.root.destroy()
         self.on_reselect()
 
@@ -83,8 +95,9 @@ class DraggableOverlay:
 
     def _format_metrics(self, m: ExpMetrics) -> str:
         hr_idx = len(m.completed_hours) + 1
+        status = " [PAUSED - UNFOCUSED]" if m.paused else ""
         return (
-            f"Raw EXP     : {m.current_exp:,}\n"
+            f"Raw EXP     : {m.current_exp:,}{status}\n"
             f"Session ({self._fmt_time(m.session_elapsed_sec)})\n"
             f"  Gained    : {m.session_exp:,}\n"
             f"  Combined  : {m.session_rate_hr:,.0f} /hr\n"
@@ -93,11 +106,20 @@ class DraggableOverlay:
             f"  Avg Full  : {m.avg_completed_hour_exp:,.0f} /hr ({len(m.completed_hours)} done)"
         )
 
-    def _poll(self) -> None:
-        metrics = self.tracker.tick()
-        self.body.config(text=self._format_metrics(metrics))
-        self.root.after(1000, self._poll)
+    def _worker_loop(self) -> None:
+        with mss.mss() as sct:
+            while self._running:
+                self._latest_metrics = self.tracker.tick(sct)
+                time.sleep(1.0)
+
+    def _render_loop(self) -> None:
+        if not self._running:
+            return
+        self.body.config(text=self._format_metrics(self._latest_metrics))
+        self.root.attributes("-topmost", True)
+        self.root.after(500, self._render_loop)
 
     def run(self) -> None:
-        self._poll()
+        threading.Thread(target=self._worker_loop, daemon=True).start()
+        self._render_loop()
         self.root.mainloop()
