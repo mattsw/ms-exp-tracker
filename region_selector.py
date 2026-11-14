@@ -4,6 +4,8 @@ import sys
 import tkinter as tk
 from pathlib import Path
 
+from window_locator import find_game_window_rect
+
 CONFIG_PATH = Path("config.json")
 
 
@@ -55,7 +57,18 @@ class RegionSelector:
         height = abs(event.y - self.start_y)
 
         if width > 10 and height > 5:
-            self.region = {"left": left, "top": top, "width": width, "height": height}
+            win_rect = find_game_window_rect()
+            if win_rect is not None:
+                win_left, win_top, _, _ = win_rect
+                self.region = {
+                    "rel_left": left - win_left,
+                    "rel_top": top - win_top,
+                    "width": width,
+                    "height": height,
+                }
+            else:
+                self.region = {"left": left, "top": top, "width": width, "height": height}
+
             CONFIG_PATH.write_text(json.dumps({"exp_region": self.region}, indent=2))
         self.root.destroy()
 

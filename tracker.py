@@ -9,6 +9,8 @@ import mss
 import numpy as np
 from rapidocr_onnxruntime import RapidOCR
 
+from window_locator import find_game_window_rect
+
 EXP_PATTERN = re.compile(r"^([^\[\(\|I]+?)[\[\(\|I]")
 TARGET_WINDOW_KEYWORDS = ("maplestory", "ms exp tracker")
 
@@ -73,10 +75,26 @@ class ExpTracker:
         _, clean = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return cv2.copyMakeBorder(clean, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
-    def read_exp_value(self, sct: mss.mss) -> int | None:
-        raw = np.array(sct.grab(self.region))
+    def _resolve_capture_box(self) -> dict[str, int] | None:
+        if "rel_left" in self.region:
+            win_rect = find_game_window_rect()
+            if win_rect is None:
+                return None
+            win_left, win_top, _, _ = win_rect
+            return {
+                "left": win_left + self.region["rel_left"],
+                "top": win_top + self.region["rel_top"],
+                "width": self.region["width"],
+                "height": self.region["height"],
+            }
+        return self.region
 
-        # Skip OCR completely if EXP bar pixels are identical to last tick
+    def read_exp_value(self, sct: mss.mss) -> int | None:
+        box = self._resolve_capture_box()
+        if box is None:
+            return None
+
+        raw = np.array(sct.grab(box))
         if self.last_frame is not None and np.array_equal(raw, self.last_frame):
             return self.last_raw_exp
         self.last_frame = raw

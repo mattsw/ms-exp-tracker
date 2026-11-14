@@ -1,7 +1,6 @@
 import threading
 import time
 import tkinter as tk
-from collections.abc import Callable
 
 import mss
 
@@ -10,12 +9,13 @@ from tracker import ExpMetrics, ExpTracker
 
 
 class DraggableOverlay:
-    def __init__(self, tracker: ExpTracker, on_reselect: Callable[[], None]) -> None:
+    def __init__(self, tracker: ExpTracker) -> None:
         enable_dpi_awareness()
         self.tracker = tracker
-        self.on_reselect = on_reselect
         self._latest_metrics = ExpMetrics()
         self._running = True
+        self._after_id: str | None = None
+        self.reselect_requested = False
 
         self.root = tk.Tk()
         self.root.title("MS EXP TRACKER")
@@ -38,7 +38,7 @@ class DraggableOverlay:
         title.pack(side=tk.LEFT, padx=4, pady=2)
 
         close_btn = tk.Button(
-            self.header, text="×", command=self._close,
+            self.header, text="×", command=self._shutdown,
             fg="#E8EAED", bg="#1F2429", bd=0, font=("Consolas", 10, "bold"),
             activebackground="#D93025", activeforeground="white"
         )
@@ -69,9 +69,19 @@ class DraggableOverlay:
             fg="#E8EAED", bg="#2B3036", bd=0, padx=6, font=("Consolas", 8)
         ).pack(side=tk.LEFT)
 
-    def _close(self) -> None:
+    def _shutdown(self) -> None:
         self._running = False
-        self.root.destroy()
+        if self._after_id is not None:
+            try:
+                self.root.after_cancel(self._after_id)
+            except tk.TclError:
+                pass
+            self._after_id = None
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _start_drag(self, event: tk.Event) -> None:
         self._drag_x = event.x
@@ -83,9 +93,8 @@ class DraggableOverlay:
         self.root.geometry(f"+{x}+{y}")
 
     def _trigger_reselect(self) -> None:
-        self._running = False
-        self.root.destroy()
-        self.on_reselect()
+        self.reselect_requested = True
+        self._shutdown()
 
     @staticmethod
     def _fmt_time(seconds: float) -> str:
@@ -115,11 +124,19 @@ class DraggableOverlay:
     def _render_loop(self) -> None:
         if not self._running:
             return
-        self.body.config(text=self._format_metrics(self._latest_metrics))
-        self.root.attributes("-topmost", True)
-        self.root.after(500, self._render_loop)
+        try:
+            self.body.config(text=self._format_metrics(self._latest_metrics))
+            self.root.attributes("-topmost", True)
+            self._after_id = self.root.after(500, self._render_loop)
+        except tk.TclError:
+            self._running = False
 
-    def run(self) -> None:
+    def run(self) -> bool:
+        """Run the overlay loop; returns True if region re-selection was requested."""
         threading.Thread(target=self._worker_loop, daemon=True).start()
         self._render_loop()
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            self._shutdown()
+        return self.reselect_requested
