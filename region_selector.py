@@ -1,12 +1,23 @@
+import ctypes
 import json
+import sys
 import tkinter as tk
 from pathlib import Path
 
 CONFIG_PATH = Path("config.json")
 
 
+def enable_dpi_awareness() -> None:
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+
+
 class RegionSelector:
     def __init__(self) -> None:
+        enable_dpi_awareness()
         self.root = tk.Tk()
         self.root.attributes("-fullscreen", True)
         self.root.attributes("-alpha", 0.3)

@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 config.json
 .env
+debug_raw.png
+debug_proc.png

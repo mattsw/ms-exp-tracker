@@ -1,0 +1,133 @@
+import re
+import time
+from dataclasses import dataclass, field
+
+import cv2
+import mss
+import numpy as np
+from rapidocr_onnxruntime import RapidOCR
+
+EXP_PATTERN = re.compile(r"^([^\[\(\|I]+?)[\[\(\|I]")
+
+@dataclass
+class ExpMetrics:
+    current_exp: int = 0
+    session_exp: int = 0
+    session_rate_hr: float = 0.0
+    current_hour_exp: int = 0
+    current_hour_rate_hr: float = 0.0
+    completed_hours: list[int] = field(default_factory=list)
+    avg_completed_hour_exp: float = 0.0
+    session_elapsed_sec: float = 0.0
+    hour_elapsed_sec: float = 0.0
+
+
+class ExpTracker:
+    def __init__(self, region: dict[str, int]) -> None:
+        self.region = region
+        self.sct = mss.mss()
+        self.ocr = RapidOCR()
+
+        now = time.monotonic()
+        self.session_start = now
+        self.hour_start = now
+
+        self.last_raw_exp: int | None = None
+        self.session_exp = 0
+        self.current_hour_exp = 0
+        self.completed_hours: list[int] = []
+
+    def _capture_and_preprocess(self) -> np.ndarray:
+        raw = np.array(self.sct.grab(self.region))
+        gray = cv2.cvtColor(raw, cv2.COLOR_BGRA2GRAY)
+
+        scaled = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_LANCZOS4)
+
+        inverted = cv2.bitwise_not(scaled)
+        _, clean = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        padded = cv2.copyMakeBorder(clean, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+        return padded
+
+    def read_exp_value(self) -> tuple[int | None, str]:
+        processed = self._capture_and_preprocess()
+        result, _ = self.ocr(processed)
+        if not result:
+            return None, ""
+
+        combined_text = " ".join(line[1] for line in result)
+        match = EXP_PATTERN.search(combined_text)
+        prefix = match.group(1) if match else combined_text.split("[")[0]
+        digits_only = re.sub(r"[^\d]", "", prefix)
+        return (int(digits_only) if digits_only else None), combined_text
+
+    def reset_all(self) -> None:
+        now = time.monotonic()
+        self.session_start = now
+        self.hour_start = now
+        self.last_raw_exp = None
+        self.session_exp = 0
+        self.current_hour_exp = 0
+        self.completed_hours.clear()
+
+    def tick(self) -> ExpMetrics:
+        now = time.monotonic()
+
+        if now - self.hour_start >= 3600.0:
+            self.completed_hours.append(self.current_hour_exp)
+            self.current_hour_exp = 0
+            self.hour_start = now
+
+        reading, _ = self.read_exp_value()
+        if reading is not None:
+            if self.last_raw_exp is None:
+                self.last_raw_exp = reading
+            else:
+                delta = reading - self.last_raw_exp
+                if 0 <= delta <= 100_000:
+                    self.session_exp += delta
+                    self.current_hour_exp += delta
+                self.last_raw_exp = reading
+
+        session_elapsed = max(1.0, now - self.session_start)
+        hour_elapsed = max(1.0, now - self.hour_start)
+
+        session_rate = (self.session_exp / session_elapsed) * 3600.0
+        hour_rate = (self.current_hour_exp / hour_elapsed) * 3600.0
+        avg_completed = (
+            sum(self.completed_hours) / len(self.completed_hours)
+            if self.completed_hours
+            else hour_rate
+        )
+
+        return ExpMetrics(
+            current_exp=self.last_raw_exp or 0,
+            session_exp=self.session_exp,
+            session_rate_hr=session_rate,
+            current_hour_exp=self.current_hour_exp,
+            current_hour_rate_hr=hour_rate,
+            completed_hours=list(self.completed_hours),
+            avg_completed_hour_exp=avg_completed,
+            session_elapsed_sec=session_elapsed,
+            hour_elapsed_sec=hour_elapsed,
+        )
+
+
+if __name__ == "__main__":
+    import json
+
+    from region_selector import CONFIG_PATH
+
+    region = json.loads(CONFIG_PATH.read_text())["exp_region"]
+    tracker = ExpTracker(region)
+
+    # Save exact raw capture and preprocessed image to project folder
+    raw_img = np.array(tracker.sct.grab(region))
+    cv2.imwrite("debug_raw.png", raw_img)
+    cv2.imwrite("debug_proc.png", tracker._capture_and_preprocess())
+    print("Saved debug_raw.png and debug_proc.png")
+
+    for _ in range(5):
+        val, raw = tracker.read_exp_value()
+        print(f"Parsed EXP: {val} | Raw OCR: {raw!r}")
+        time.sleep(1.0)
