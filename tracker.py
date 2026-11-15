@@ -52,13 +52,16 @@ class ExpTracker:
     MAX_SINGLE_TICK_PCT = 2.00
     MIN_SAMPLE_PCT_STEP = 0.03
 
-    def __init__(self, exp_region: dict[str, int], pct_region: dict[str, int]) -> None:
+    # Matches "13,862[1.66%]" even if '[' is misread as 'I', '|', '1', '(', or omitted
+    _LINE_PATTERN = re.compile(
+        r"([0-9][0-9,]*)\s*[\[\(\{I|l1]?\s*(\d{1,2}\.\d{2})\s*%?\s*[\]\)\}]?"
+    )
+
+    def __init__(self, exp_region: dict[str, int]) -> None:
         self._lock = threading.Lock()
         self._exp_region = dict(exp_region)
-        self._pct_region = dict(pct_region)
         self._ocr = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
-        self._prev_exp_frame: np.ndarray | None = None
-        self._prev_pct_frame: np.ndarray | None = None
+        self._prev_frame: np.ndarray | None = None
         self._reset_unlocked()
 
     def _reset_unlocked(self) -> None:
@@ -83,8 +86,7 @@ class ExpTracker:
 
     def reset_all(self) -> None:
         with self._lock:
-            self._prev_exp_frame = None
-            self._prev_pct_frame = None
+            self._prev_frame = None
             self._reset_unlocked()
 
     def _preprocess(self, bgra: np.ndarray) -> np.ndarray:
@@ -94,37 +96,44 @@ class ExpTracker:
         _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         return cv2.copyMakeBorder(thresh, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
 
-    def _ocr_text(self, processed: np.ndarray) -> str:
-        result, _ = self._ocr(processed)
+    def _parse_frame(self, bgra: np.ndarray) -> tuple[int | None, float | None]:
+        result, _ = self._ocr(self._preprocess(bgra))
         if not result:
-            return ""
-        return "".join(item[1] for item in result)
+            return None, None
+        joined = "".join(item[1] for item in result).replace(" ", "")
 
-    def _parse_exp(self, bgra: np.ndarray) -> int | None:
-        raw = self._ocr_text(self._preprocess(bgra))
-        digits = re.sub(r"\D", "", raw)
-        return int(digits) if digits else None
+        match = self._LINE_PATTERN.search(joined)
+        if match:
+            exp_digits = re.sub(r"\D", "", match.group(1))
+            parsed_exp = int(exp_digits) if exp_digits else None
+            pct_val = float(match.group(2))
+            parsed_pct = pct_val if 0.0 <= pct_val < 100.0 else None
+            return parsed_exp, parsed_pct
 
-    def _parse_pct(self, bgra: np.ndarray) -> float | None:
-        raw = self._ocr_text(self._preprocess(bgra))
-        cleaned = raw.replace(" ", "")
-        match = re.search(r"(\d{1,2}\.\d{2})", cleaned)
-        if not match:
-            return None
-        val = float(match.group(1))
-        return val if 0.0 <= val < 100.0 else None
+        # Fallback: extract standalone percentage if present, and digits before '['
+        pct_match = re.search(r"(\d{1,2}\.\d{2})", joined)
+        parsed_pct = None
+        if pct_match:
+            val = float(pct_match.group(1))
+            if 0.0 <= val < 100.0:
+                parsed_pct = val
 
-    def _resolve_monitor(self, region: dict[str, int], win_rect: tuple[int, int, int, int] | None) -> dict[str, int] | None:
-        if "rel_left" in region:
+        prefix = joined.split("[")[0] if "[" in joined else joined[: pct_match.start()] if pct_match else joined
+        exp_digits = re.sub(r"\D", "", prefix)
+        parsed_exp = int(exp_digits) if exp_digits else None
+        return parsed_exp, parsed_pct
+
+    def _resolve_monitor(self, win_rect: tuple[int, int, int, int] | None) -> dict[str, int] | None:
+        if "rel_left" in self._exp_region:
             if win_rect is None:
                 return None
             return {
-                "left": win_rect[0] + region["rel_left"],
-                "top": win_rect[1] + region["rel_top"],
-                "width": region["width"],
-                "height": region["height"],
+                "left": win_rect[0] + self._exp_region["rel_left"],
+                "top": win_rect[1] + self._exp_region["rel_top"],
+                "width": self._exp_region["width"],
+                "height": self._exp_region["height"],
             }
-        return dict(region)
+        return dict(self._exp_region)
 
     def _estimate_level_total_unlocked(self) -> float | None:
         if not self._level_total_samples:
@@ -136,7 +145,6 @@ class ExpTracker:
         while hour_active >= 3600.0:
             self._completed_hours.append(self._current_hour_exp)
             self._current_hour_exp = 0
-            # Advance hour_start by exact 3600s of active time + accumulated pause so no elapsed seconds drift
             self._hour_start += 3600.0 + self._paused_hour_sec
             self._paused_hour_sec = 0.0
             hour_active = now - self._hour_start
@@ -181,43 +189,33 @@ class ExpTracker:
             self._advance_hour_buckets_unlocked(now)
 
             win_rect = find_game_window_rect()
-            exp_mon = self._resolve_monitor(self._exp_region, win_rect)
-            pct_mon = self._resolve_monitor(self._pct_region, win_rect)
-            prev_exp_frame = self._prev_exp_frame
-            prev_pct_frame = self._prev_pct_frame
+            monitor = self._resolve_monitor(win_rect)
+            prev_frame = self._prev_frame
 
         new_exp: int | None = None
-        exp_changed = False
-        if exp_mon is not None:
-            exp_img = np.array(sct.grab(exp_mon))
-            if prev_exp_frame is None or not np.array_equal(exp_img, prev_exp_frame):
-                exp_changed = True
-                new_exp = self._parse_exp(exp_img)
-                with self._lock:
-                    self._prev_exp_frame = exp_img
-
         new_pct: float | None = None
-        pct_changed = False
-        if pct_mon is not None:
-            pct_img = np.array(sct.grab(pct_mon))
-            if prev_pct_frame is None or not np.array_equal(pct_img, prev_pct_frame):
-                pct_changed = True
-                new_pct = self._parse_pct(pct_img)
+        frame_changed = False
+
+        if monitor is not None:
+            img = np.array(sct.grab(monitor))
+            if prev_frame is None or not np.array_equal(img, prev_frame):
+                frame_changed = True
+                new_exp, new_pct = self._parse_frame(img)
                 with self._lock:
-                    self._prev_pct_frame = pct_img
+                    self._prev_frame = img
 
         with self._lock:
-            # 1. Detect level-up rollover from either EXP reset or percentage rollover
+            if not frame_changed:
+                return self._build_metrics_unlocked(time.monotonic(), paused=False)
+
             pct_rolled_over = (
-                pct_changed
-                and new_pct is not None
+                new_pct is not None
                 and self._last_valid_pct is not None
                 and self._last_valid_pct > 95.0
                 and new_pct < 5.0
             )
             exp_rolled_over = (
-                exp_changed
-                and new_exp is not None
+                new_exp is not None
                 and self._last_valid_exp is not None
                 and self._last_valid_pct is not None
                 and self._last_valid_pct > 95.0
@@ -226,14 +224,10 @@ class ExpTracker:
             )
 
             if pct_rolled_over or exp_rolled_over:
-                self._handle_level_up_unlocked(
-                    new_exp if exp_changed else None,
-                    new_pct if pct_changed else None,
-                )
+                self._handle_level_up_unlocked(new_exp, new_pct)
                 return self._build_metrics_unlocked(time.monotonic(), paused=False)
 
-            # 2. Process standard EXP delta with two-frame confirmation on large jumps
-            if exp_changed and new_exp is not None:
+            if new_exp is not None:
                 if self._baseline_exp is None:
                     self._baseline_exp = new_exp
                     self._last_valid_exp = new_exp
@@ -246,7 +240,6 @@ class ExpTracker:
                         self._last_valid_exp = new_exp
                         self._pending_suspect_exp = None
                     elif delta > self.MAX_SINGLE_TICK_EXP:
-                        # Require identical confirmation on a subsequent frame before trusting >25k jump
                         if self._pending_suspect_exp == new_exp:
                             self._last_valid_exp = new_exp
                             self._sample_anchor_exp = new_exp
@@ -255,8 +248,7 @@ class ExpTracker:
                         else:
                             self._pending_suspect_exp = new_exp
 
-            # 3. Process standard percentage delta and record median level-total samples
-            if pct_changed and new_pct is not None:
+            if new_pct is not None:
                 if self._last_valid_pct is None:
                     self._last_valid_pct = new_pct
                     self._sample_anchor_pct = new_pct
@@ -300,7 +292,7 @@ class ExpTracker:
 
         est_total = self._estimate_level_total_unlocked()
         if est_total is not None and self._last_valid_pct is not None:
-            est_level_total = int(round(est_total))
+            est_level_total = round(est_total)
             remaining_pct = max(0.0, 100.0 - self._last_valid_pct)
             remaining_exp = est_total * (remaining_pct / 100.0)
             if session_rate > 0:
