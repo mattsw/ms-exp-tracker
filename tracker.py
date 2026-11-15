@@ -1,5 +1,6 @@
 import ctypes
 import re
+import statistics
 import sys
 import threading
 import time
@@ -47,9 +48,9 @@ def _is_game_focused() -> bool:
 
 
 class ExpTracker:
-    MAX_SINGLE_TICK_EXP = 100_000
-    MAX_SINGLE_TICK_PCT = 2.50
-    MIN_PCT_DELTA_FOR_TTL = 0.05
+    MAX_SINGLE_TICK_EXP = 25_000
+    MAX_SINGLE_TICK_PCT = 2.00
+    MIN_SAMPLE_PCT_STEP = 0.03
 
     def __init__(self, exp_region: dict[str, int], pct_region: dict[str, int]) -> None:
         self._lock = threading.Lock()
@@ -70,13 +71,15 @@ class ExpTracker:
 
         self._baseline_exp: int | None = None
         self._last_valid_exp: int | None = None
+        self._pending_suspect_exp: int | None = None
         self._session_exp = 0
         self._current_hour_exp = 0
         self._completed_hours: list[int] = []
 
-        self._level_anchor_exp: int | None = None
-        self._level_anchor_pct: float | None = None
         self._last_valid_pct: float | None = None
+        self._sample_anchor_exp: int | None = None
+        self._sample_anchor_pct: float | None = None
+        self._level_total_samples: list[float] = []
 
     def reset_all(self) -> None:
         with self._lock:
@@ -104,7 +107,6 @@ class ExpTracker:
 
     def _parse_pct(self, bgra: np.ndarray) -> float | None:
         raw = self._ocr_text(self._preprocess(bgra))
-        # Strip spaces and enforce exact XX.XX or X.XX decimal match
         cleaned = raw.replace(" ", "")
         match = re.search(r"(\d{1,2}\.\d{2})", cleaned)
         if not match:
@@ -124,6 +126,42 @@ class ExpTracker:
             }
         return dict(region)
 
+    def _estimate_level_total_unlocked(self) -> float | None:
+        if not self._level_total_samples:
+            return None
+        return float(statistics.median(self._level_total_samples))
+
+    def _advance_hour_buckets_unlocked(self, now: float) -> None:
+        hour_active = now - self._hour_start - self._paused_hour_sec
+        while hour_active >= 3600.0:
+            self._completed_hours.append(self._current_hour_exp)
+            self._current_hour_exp = 0
+            # Advance hour_start by exact 3600s of active time + accumulated pause so no elapsed seconds drift
+            self._hour_start += 3600.0 + self._paused_hour_sec
+            self._paused_hour_sec = 0.0
+            hour_active = now - self._hour_start
+
+    def _handle_level_up_unlocked(self, new_exp: int | None, new_pct: float | None) -> None:
+        est_total = self._estimate_level_total_unlocked()
+        if est_total is not None and self._last_valid_exp is not None:
+            remainder = max(0, int(round(est_total - self._last_valid_exp)))
+            if remainder <= self.MAX_SINGLE_TICK_EXP:
+                self._session_exp += remainder
+                self._current_hour_exp += remainder
+
+        if new_exp is not None and new_exp <= self.MAX_SINGLE_TICK_EXP:
+            self._session_exp += new_exp
+            self._current_hour_exp += new_exp
+            self._last_valid_exp = new_exp
+        else:
+            self._last_valid_exp = 0
+
+        self._last_valid_pct = new_pct if (new_pct is not None and new_pct < 5.0) else 0.0
+        self._sample_anchor_exp = self._last_valid_exp
+        self._sample_anchor_pct = self._last_valid_pct
+        self._level_total_samples.clear()
+        self._pending_suspect_exp = None
+
     def tick(self, sct: mss.mss) -> ExpMetrics:
         now = time.monotonic()
         focused = _is_game_focused()
@@ -140,12 +178,7 @@ class ExpTracker:
                 self._paused_hour_sec += paused_dur
                 self._pause_started_at = None
 
-            hour_active = now - self._hour_start - self._paused_hour_sec
-            if hour_active >= 3600.0:
-                self._completed_hours.append(self._current_hour_exp)
-                self._current_hour_exp = 0
-                self._hour_start = now
-                self._paused_hour_sec = 0.0
+            self._advance_hour_buckets_unlocked(now)
 
             win_rect = find_game_window_rect()
             exp_mon = self._resolve_monitor(self._exp_region, win_rect)
@@ -174,36 +207,82 @@ class ExpTracker:
                     self._prev_pct_frame = pct_img
 
         with self._lock:
+            # 1. Detect level-up rollover from either EXP reset or percentage rollover
+            pct_rolled_over = (
+                pct_changed
+                and new_pct is not None
+                and self._last_valid_pct is not None
+                and self._last_valid_pct > 95.0
+                and new_pct < 5.0
+            )
+            exp_rolled_over = (
+                exp_changed
+                and new_exp is not None
+                and self._last_valid_exp is not None
+                and self._last_valid_pct is not None
+                and self._last_valid_pct > 95.0
+                and new_exp < self._last_valid_exp
+                and new_exp <= self.MAX_SINGLE_TICK_EXP
+            )
+
+            if pct_rolled_over or exp_rolled_over:
+                self._handle_level_up_unlocked(
+                    new_exp if exp_changed else None,
+                    new_pct if pct_changed else None,
+                )
+                return self._build_metrics_unlocked(time.monotonic(), paused=False)
+
+            # 2. Process standard EXP delta with two-frame confirmation on large jumps
             if exp_changed and new_exp is not None:
                 if self._baseline_exp is None:
                     self._baseline_exp = new_exp
                     self._last_valid_exp = new_exp
+                    self._sample_anchor_exp = new_exp
                 elif self._last_valid_exp is not None:
                     delta = new_exp - self._last_valid_exp
                     if 0 <= delta <= self.MAX_SINGLE_TICK_EXP:
                         self._session_exp += delta
                         self._current_hour_exp += delta
                         self._last_valid_exp = new_exp
+                        self._pending_suspect_exp = None
+                    elif delta > self.MAX_SINGLE_TICK_EXP:
+                        # Require identical confirmation on a subsequent frame before trusting >25k jump
+                        if self._pending_suspect_exp == new_exp:
+                            self._last_valid_exp = new_exp
+                            self._sample_anchor_exp = new_exp
+                            self._sample_anchor_pct = self._last_valid_pct
+                            self._pending_suspect_exp = None
+                        else:
+                            self._pending_suspect_exp = new_exp
 
+            # 3. Process standard percentage delta and record median level-total samples
             if pct_changed and new_pct is not None:
                 if self._last_valid_pct is None:
                     self._last_valid_pct = new_pct
-                    if self._last_valid_exp is not None:
-                        self._level_anchor_exp = self._last_valid_exp
-                        self._level_anchor_pct = new_pct
+                    self._sample_anchor_pct = new_pct
+                    if self._sample_anchor_exp is None and self._last_valid_exp is not None:
+                        self._sample_anchor_exp = self._last_valid_exp
                 else:
                     pct_delta = new_pct - self._last_valid_pct
-                    # Level-up rollover (e.g., 99.92% -> 0.04%)
-                    if self._last_valid_pct > 95.0 and new_pct < 5.0:
+                    if 0.0 <= pct_delta <= self.MAX_SINGLE_TICK_PCT:
                         self._last_valid_pct = new_pct
-                        if self._last_valid_exp is not None:
-                            self._level_anchor_exp = self._last_valid_exp
-                            self._level_anchor_pct = new_pct
-                    elif 0.0 <= pct_delta <= self.MAX_SINGLE_TICK_PCT:
-                        self._last_valid_pct = new_pct
-                        if self._level_anchor_exp is None and self._last_valid_exp is not None:
-                            self._level_anchor_exp = self._last_valid_exp
-                            self._level_anchor_pct = new_pct
+                        if self._sample_anchor_exp is None and self._last_valid_exp is not None:
+                            self._sample_anchor_exp = self._last_valid_exp
+                            self._sample_anchor_pct = new_pct
+                        elif (
+                            self._last_valid_exp is not None
+                            and self._sample_anchor_exp is not None
+                            and self._sample_anchor_pct is not None
+                        ):
+                            step_exp = self._last_valid_exp - self._sample_anchor_exp
+                            step_pct = self._last_valid_pct - self._sample_anchor_pct
+                            if step_exp > 0 and step_pct >= self.MIN_SAMPLE_PCT_STEP:
+                                implied_total = step_exp / (step_pct / 100.0)
+                                self._level_total_samples.append(implied_total)
+                                if len(self._level_total_samples) > 40:
+                                    self._level_total_samples.pop(0)
+                                self._sample_anchor_exp = self._last_valid_exp
+                                self._sample_anchor_pct = self._last_valid_pct
 
             return self._build_metrics_unlocked(time.monotonic(), paused=False)
 
@@ -219,21 +298,13 @@ class ExpTracker:
         est_level_total: int | None = None
         ttl_sec: float | None = None
 
-        if (
-            self._last_valid_exp is not None
-            and self._last_valid_pct is not None
-            and self._level_anchor_exp is not None
-            and self._level_anchor_pct is not None
-        ):
-            d_exp = self._last_valid_exp - self._level_anchor_exp
-            d_pct = self._last_valid_pct - self._level_anchor_pct
-            if d_exp > 0 and d_pct >= self.MIN_PCT_DELTA_FOR_TTL:
-                est_total = d_exp / (d_pct / 100.0)
-                est_level_total = round(est_total)
-                remaining_pct = max(0.0, 100.0 - self._last_valid_pct)
-                remaining_exp = est_total * (remaining_pct / 100.0)
-                if session_rate > 0:
-                    ttl_sec = (remaining_exp / session_rate) * 3600.0
+        est_total = self._estimate_level_total_unlocked()
+        if est_total is not None and self._last_valid_pct is not None:
+            est_level_total = int(round(est_total))
+            remaining_pct = max(0.0, 100.0 - self._last_valid_pct)
+            remaining_exp = est_total * (remaining_pct / 100.0)
+            if session_rate > 0:
+                ttl_sec = (remaining_exp / session_rate) * 3600.0
 
         return ExpMetrics(
             current_exp=self._last_valid_exp or 0,
