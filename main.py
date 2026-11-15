@@ -16,7 +16,6 @@ def get_region(force_reselect: bool = False) -> dict[str, int]:
 
 
 def launch() -> None:
-    # Ensure Ctrl+C in PowerShell terminates cleanly without Tcl traceback noise
     signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
     force_reselect = False

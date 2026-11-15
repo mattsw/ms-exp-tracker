@@ -105,14 +105,22 @@ class DraggableOverlay:
     def _format_metrics(self, m: ExpMetrics) -> str:
         hr_idx = len(m.completed_hours) + 1
         status = " [PAUSED - UNFOCUSED]" if m.paused else ""
+        pct_str = f" ({m.current_pct:.2f}%)" if m.current_pct is not None else ""
+
+        if m.ttl_seconds is not None and m.est_level_total_exp is not None:
+            ttl_str = f"{self._fmt_time(m.ttl_seconds)} (~{m.est_level_total_exp:,} lvl)"
+        else:
+            ttl_str = "Calibrating (+0.05% needed)"
+
         return (
-            f"Raw EXP     : {m.current_exp:,}{status}\n"
+            f"Raw EXP     : {m.current_exp:,}{pct_str}{status}\n"
             f"Session ({self._fmt_time(m.session_elapsed_sec)})\n"
             f"  Gained    : {m.session_exp:,}\n"
             f"  Combined  : {m.session_rate_hr:,.0f} /hr\n"
             f"Hour #{hr_idx} ({self._fmt_time(m.hour_elapsed_sec)})\n"
             f"  Bucket    : {m.current_hour_exp:,} ({m.current_hour_rate_hr:,.0f}/hr)\n"
-            f"  Avg Full  : {m.avg_completed_hour_exp:,.0f} /hr ({len(m.completed_hours)} done)"
+            f"  Avg Full  : {m.avg_completed_hour_exp:,.0f} /hr ({len(m.completed_hours)} done)\n"
+            f"Next Lvl    : {ttl_str}"
         )
 
     def _worker_loop(self) -> None:
