@@ -51,11 +51,7 @@ class ExpTracker:
     MAX_SINGLE_TICK_EXP = 25_000
     MAX_SINGLE_TICK_PCT = 2.00
     MIN_SAMPLE_PCT_STEP = 0.03
-
-    # Matches "13,862[1.66%]" even if '[' is misread as 'I', '|', '1', '(', or omitted
-    _LINE_PATTERN = re.compile(
-        r"([0-9][0-9,]*)\s*[\[\(\{I|l1]?\s*(\d{1,2}\.\d{2})\s*%?\s*[\]\)\}]?"
-    )
+    BORDER_PAD = 24
 
     def __init__(self, exp_region: dict[str, int]) -> None:
         self._lock = threading.Lock()
@@ -89,37 +85,92 @@ class ExpTracker:
             self._prev_frame = None
             self._reset_unlocked()
 
-    def _preprocess(self, bgra: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+    def _preprocess_exp(self, bgr_crop: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
         upscaled = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_LANCZOS4)
         inverted = cv2.bitwise_not(upscaled)
         _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return cv2.copyMakeBorder(thresh, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+        return cv2.copyMakeBorder(
+            thresh, self.BORDER_PAD, self.BORDER_PAD, self.BORDER_PAD, self.BORDER_PAD,
+            cv2.BORDER_CONSTANT, value=255
+        )
+
+    def _preprocess_pct(self, bgr_crop: np.ndarray) -> np.ndarray:
+        # Target CRNN recognizer input height (48px) with clean cubic upscale and white border
+        gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
+        scale = 48.0 / max(1, gray.shape[0])
+        upscaled = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+        _, thresh = cv2.threshold(upscaled, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return cv2.copyMakeBorder(thresh, 8, 8, 16, 16, cv2.BORDER_CONSTANT, value=255)
+
+    def _ocr_text(self, processed: np.ndarray) -> str:
+        result, _ = self._ocr(processed)
+        if not result:
+            return ""
+        sorted_boxes = sorted(result, key=lambda item: item[0][0][0])
+        return "".join(item[1].strip() for item in sorted_boxes).replace(" ", "")
+
+    def _find_bracket_spans(self, green_cols: np.ndarray) -> list[tuple[int, int]]:
+        if green_cols.size == 0:
+            return []
+        spans: list[tuple[int, int]] = []
+        start = int(green_cols[0])
+        prev = start
+        for col in green_cols[1:]:
+            c = int(col)
+            if c > prev + 2:
+                spans.append((start, prev))
+                start = c
+            prev = c
+        spans.append((start, prev))
+        return spans
 
     def _parse_frame(self, bgra: np.ndarray) -> tuple[int | None, float | None]:
-        result, _ = self._ocr(self._preprocess(bgra))
-        if not result:
-            return None, None
-        joined = "".join(item[1] for item in result).replace(" ", "")
+        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-        match = self._LINE_PATTERN.search(joined)
-        if match:
-            exp_digits = re.sub(r"\D", "", match.group(1))
+        green_mask = cv2.inRange(hsv, np.array([35, 80, 90]), np.array([90, 255, 255]))
+        green_cols = np.where(np.any(green_mask > 0, axis=0))[0]
+        spans = self._find_bracket_spans(green_cols)
+
+        if spans:
+            left_bracket_start, left_bracket_end = spans[0]
+            exp_crop = bgr[:, : max(1, left_bracket_start)]
+
+            pct_start = min(bgr.shape[1] - 1, left_bracket_end + 1)
+            pct_end = spans[-1][0] if len(spans) >= 2 and spans[-1][0] > pct_start + 8 else bgr.shape[1]
+            pct_crop = bgr[:, pct_start:pct_end]
+
+            exp_text = self._ocr_text(self._preprocess_exp(exp_crop))
+            exp_digits = re.sub(r"\D", "", exp_text)
             parsed_exp = int(exp_digits) if exp_digits else None
-            pct_val = float(match.group(2))
-            parsed_pct = pct_val if 0.0 <= pct_val < 100.0 else None
+
+            parsed_pct: float | None = None
+            
+            if pct_crop.size > 0 and pct_crop.shape[1] >= 8:
+                proc_pct = self._preprocess_pct(pct_crop)
+                rec_res, _ = self._ocr(proc_pct, use_det=False, use_cls=False, use_rec=True)
+                pct_text = "".join(item[0] for item in rec_res).replace(" ", "") if rec_res else ""
+                pct_match = re.search(r"(\d{1,2}\.\d{2})", pct_text)
+                if pct_match:
+                    val = float(pct_match.group(1))
+                    if 0.0 <= val < 100.0:
+                        parsed_pct = val
+
             return parsed_exp, parsed_pct
 
-        # Fallback: extract standalone percentage if present, and digits before '['
-        pct_match = re.search(r"(\d{1,2}\.\d{2})", joined)
+        # Fallback if '[' bracket is absent
+        full_text = self._ocr_text(self._preprocess_exp(bgr))
+        pct_match = re.search(r"(\d{1,2}\.\d{2})%", full_text)
         parsed_pct = None
+        exp_section = full_text
         if pct_match:
             val = float(pct_match.group(1))
             if 0.0 <= val < 100.0:
                 parsed_pct = val
+            exp_section = full_text[: pct_match.start()]
 
-        prefix = joined.split("[")[0] if "[" in joined else joined[: pct_match.start()] if pct_match else joined
-        exp_digits = re.sub(r"\D", "", prefix)
+        exp_digits = re.sub(r"\D", "", exp_section)
         parsed_exp = int(exp_digits) if exp_digits else None
         return parsed_exp, parsed_pct
 
