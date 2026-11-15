@@ -48,13 +48,16 @@ def _is_game_focused() -> bool:
 
 class ExpTracker:
     MAX_SINGLE_TICK_EXP = 100_000
+    MAX_SINGLE_TICK_PCT = 2.50
     MIN_PCT_DELTA_FOR_TTL = 0.05
 
-    def __init__(self, region: dict[str, int]) -> None:
+    def __init__(self, exp_region: dict[str, int], pct_region: dict[str, int]) -> None:
         self._lock = threading.Lock()
-        self._region = dict(region)
+        self._exp_region = dict(exp_region)
+        self._pct_region = dict(pct_region)
         self._ocr = RapidOCR(intra_op_num_threads=1, inter_op_num_threads=1)
-        self._prev_frame: np.ndarray | None = None
+        self._prev_exp_frame: np.ndarray | None = None
+        self._prev_pct_frame: np.ndarray | None = None
         self._reset_unlocked()
 
     def _reset_unlocked(self) -> None:
@@ -77,19 +80,12 @@ class ExpTracker:
 
     def reset_all(self) -> None:
         with self._lock:
-            self._prev_frame = None
+            self._prev_exp_frame = None
+            self._prev_pct_frame = None
             self._reset_unlocked()
 
-    def _find_bracket_x(self, bgr: np.ndarray) -> int | None:
-        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        lower_green = np.array([30, 80, 100], dtype=np.uint8)
-        upper_green = np.array([90, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_green, upper_green)
-        cols = np.where(np.any(mask > 0, axis=0))[0]
-        return int(cols[0]) if cols.size > 0 else None
-
-    def _preprocess_crop(self, bgr_crop: np.ndarray) -> np.ndarray:
-        gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
+    def _preprocess(self, bgra: np.ndarray) -> np.ndarray:
+        gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
         upscaled = cv2.resize(gray, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_LANCZOS4)
         inverted = cv2.bitwise_not(upscaled)
         _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -101,44 +97,32 @@ class ExpTracker:
             return ""
         return "".join(item[1] for item in result)
 
-    def _parse_frame(self, bgra: np.ndarray) -> tuple[int | None, float | None]:
-        bgr = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
-        bracket_x = self._find_bracket_x(bgr)
+    def _parse_exp(self, bgra: np.ndarray) -> int | None:
+        raw = self._ocr_text(self._preprocess(bgra))
+        digits = re.sub(r"\D", "", raw)
+        return int(digits) if digits else None
 
-        if bracket_x is not None and bracket_x > 8:
-            exp_crop = bgr[:, :bracket_x]
-            pct_crop = bgr[:, bracket_x:]
-        else:
-            exp_crop = bgr
-            pct_crop = None
+    def _parse_pct(self, bgra: np.ndarray) -> float | None:
+        raw = self._ocr_text(self._preprocess(bgra))
+        # Strip spaces and enforce exact XX.XX or X.XX decimal match
+        cleaned = raw.replace(" ", "")
+        match = re.search(r"(\d{1,2}\.\d{2})", cleaned)
+        if not match:
+            return None
+        val = float(match.group(1))
+        return val if 0.0 <= val < 100.0 else None
 
-        exp_raw = self._ocr_text(self._preprocess_crop(exp_crop))
-        digits = re.sub(r"\D", "", exp_raw)
-        parsed_exp = int(digits) if digits else None
-
-        parsed_pct: float | None = None
-        if pct_crop is not None and pct_crop.shape[1] > 12:
-            pct_raw = self._ocr_text(self._preprocess_crop(pct_crop))
-            match = re.search(r"(\d{1,2}\.\d{2})", pct_raw)
-            if match:
-                val = float(match.group(1))
-                if 0.0 <= val < 100.0:
-                    parsed_pct = val
-
-        return parsed_exp, parsed_pct
-
-    def _resolve_monitor(self) -> dict[str, int] | None:
-        if "rel_left" in self._region:
-            win_rect = find_game_window_rect()
+    def _resolve_monitor(self, region: dict[str, int], win_rect: tuple[int, int, int, int] | None) -> dict[str, int] | None:
+        if "rel_left" in region:
             if win_rect is None:
                 return None
             return {
-                "left": win_rect[0] + self._region["rel_left"],
-                "top": win_rect[1] + self._region["rel_top"],
-                "width": self._region["width"],
-                "height": self._region["height"],
+                "left": win_rect[0] + region["rel_left"],
+                "top": win_rect[1] + region["rel_top"],
+                "width": region["width"],
+                "height": region["height"],
             }
-        return dict(self._region)
+        return dict(region)
 
     def tick(self, sct: mss.mss) -> ExpMetrics:
         now = time.monotonic()
@@ -163,53 +147,63 @@ class ExpTracker:
                 self._hour_start = now
                 self._paused_hour_sec = 0.0
 
-            monitor = self._resolve_monitor()
-            prev_frame = self._prev_frame
+            win_rect = find_game_window_rect()
+            exp_mon = self._resolve_monitor(self._exp_region, win_rect)
+            pct_mon = self._resolve_monitor(self._pct_region, win_rect)
+            prev_exp_frame = self._prev_exp_frame
+            prev_pct_frame = self._prev_pct_frame
 
-        parsed_exp: int | None = None
-        parsed_pct: float | None = None
-        frame_changed = False
-
-        if monitor is not None:
-            raw_img = np.array(sct.grab(monitor))
-            if prev_frame is None or not np.array_equal(raw_img, prev_frame):
-                frame_changed = True
-                parsed_exp, parsed_pct = self._parse_frame(raw_img)
+        new_exp: int | None = None
+        exp_changed = False
+        if exp_mon is not None:
+            exp_img = np.array(sct.grab(exp_mon))
+            if prev_exp_frame is None or not np.array_equal(exp_img, prev_exp_frame):
+                exp_changed = True
+                new_exp = self._parse_exp(exp_img)
                 with self._lock:
-                    self._prev_frame = raw_img
+                    self._prev_exp_frame = exp_img
+
+        new_pct: float | None = None
+        pct_changed = False
+        if pct_mon is not None:
+            pct_img = np.array(sct.grab(pct_mon))
+            if prev_pct_frame is None or not np.array_equal(pct_img, prev_pct_frame):
+                pct_changed = True
+                new_pct = self._parse_pct(pct_img)
+                with self._lock:
+                    self._prev_pct_frame = pct_img
 
         with self._lock:
-            if frame_changed:
-                if parsed_exp is not None:
-                    if self._baseline_exp is None:
-                        self._baseline_exp = parsed_exp
-                        self._last_valid_exp = parsed_exp
-                    elif self._last_valid_exp is not None:
-                        delta = parsed_exp - self._last_valid_exp
-                        if 0 <= delta <= self.MAX_SINGLE_TICK_EXP:
-                            self._session_exp += delta
-                            self._current_hour_exp += delta
-                            self._last_valid_exp = parsed_exp
+            if exp_changed and new_exp is not None:
+                if self._baseline_exp is None:
+                    self._baseline_exp = new_exp
+                    self._last_valid_exp = new_exp
+                elif self._last_valid_exp is not None:
+                    delta = new_exp - self._last_valid_exp
+                    if 0 <= delta <= self.MAX_SINGLE_TICK_EXP:
+                        self._session_exp += delta
+                        self._current_hour_exp += delta
+                        self._last_valid_exp = new_exp
 
-                if parsed_pct is not None:
-                    if self._last_valid_pct is None:
-                        self._last_valid_pct = parsed_pct
+            if pct_changed and new_pct is not None:
+                if self._last_valid_pct is None:
+                    self._last_valid_pct = new_pct
+                    if self._last_valid_exp is not None:
+                        self._level_anchor_exp = self._last_valid_exp
+                        self._level_anchor_pct = new_pct
+                else:
+                    pct_delta = new_pct - self._last_valid_pct
+                    # Level-up rollover (e.g., 99.92% -> 0.04%)
+                    if self._last_valid_pct > 95.0 and new_pct < 5.0:
+                        self._last_valid_pct = new_pct
                         if self._last_valid_exp is not None:
                             self._level_anchor_exp = self._last_valid_exp
-                            self._level_anchor_pct = parsed_pct
-                    else:
-                        pct_delta = parsed_pct - self._last_valid_pct
-                        if pct_delta < -5.0:
-                            # Level-up rollover (e.g., 99.95% -> 0.02%)
-                            self._last_valid_pct = parsed_pct
-                            if self._last_valid_exp is not None:
-                                self._level_anchor_exp = self._last_valid_exp
-                                self._level_anchor_pct = parsed_pct
-                        elif 0.0 <= pct_delta <= 15.0:
-                            self._last_valid_pct = parsed_pct
-                            if self._level_anchor_exp is None and self._last_valid_exp is not None:
-                                self._level_anchor_exp = self._last_valid_exp
-                                self._level_anchor_pct = parsed_pct
+                            self._level_anchor_pct = new_pct
+                    elif 0.0 <= pct_delta <= self.MAX_SINGLE_TICK_PCT:
+                        self._last_valid_pct = new_pct
+                        if self._level_anchor_exp is None and self._last_valid_exp is not None:
+                            self._level_anchor_exp = self._last_valid_exp
+                            self._level_anchor_pct = new_pct
 
             return self._build_metrics_unlocked(time.monotonic(), paused=False)
 
